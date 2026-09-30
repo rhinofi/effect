@@ -202,6 +202,7 @@ export const make = Effect.fnUntraced(function*<
     const activeRequests: EntityState["activeRequests"] = new Map()
     let defectRequestIds = new Set<Snowflake.Snowflake>()
     let isRestartingDueToDefect = false
+    let pendingDefect = Option.none<Cause.Cause<never>>()
 
     // the server is stored in a ref, so if there is a defect, we can
     // swap the server without losing the active requests
@@ -209,6 +210,7 @@ export const make = Effect.fnUntraced(function*<
       scope,
       Effect.fnUntraced(function*(handlerScope) {
         let isShuttingDown = false
+        let hasDefect = false
 
         const handlerContext = context.pipe(
           Context.add(CurrentAddress, address),
@@ -335,6 +337,10 @@ export const make = Effect.fnUntraced(function*<
                 ))
               }
               case "Defect": {
+                // Multiple requests can defect before these handlers are torn down.
+                // Only a defect from replacement handlers needs another restart.
+                if (hasDefect || isShuttingDown) return Effect.void
+                hasDefect = true
                 return Effect.forkIn(onDefect(Cause.die(response.defect)), managerScope)
               }
               case "ClientEnd": {
@@ -387,8 +393,12 @@ export const make = Effect.fnUntraced(function*<
         return endLatch.open
       }
       if (isRestartingDueToDefect) {
+        // Replayed requests can defect before ResourceRef finishes publishing
+        // the replacement. Wait for that rebuild before starting another one.
+        pendingDefect = Option.some(cause)
         return Effect.void
       }
+      pendingDefect = Option.none()
       defectRequestIds = new Set(activeRequests.keys())
       isRestartingDueToDefect = true
       const effect = writeRef.rebuildUnsafe()
@@ -403,7 +413,8 @@ export const make = Effect.fnUntraced(function*<
           address,
           runner: options.runnerAddress
         }),
-        Effect.catchCause(onDefect)
+        Effect.catchCause(onDefect),
+        Effect.andThen(Effect.suspend(() => Option.isSome(pendingDefect) ? onDefect(pendingDefect.value) : Effect.void))
       )
     }
 
