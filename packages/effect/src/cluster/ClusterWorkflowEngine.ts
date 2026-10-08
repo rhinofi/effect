@@ -32,6 +32,7 @@ import * as DurableClock from "../workflow/DurableClock.ts"
 import * as DurableDeferred from "../workflow/DurableDeferred.ts"
 import * as Workflow from "../workflow/Workflow.ts"
 import * as WorkflowEngine from "../workflow/WorkflowEngine.ts"
+import { makeHashDigest } from "../workflow/internal/crypto.ts"
 import * as ClusterSchema from "./ClusterSchema.ts"
 import * as DeliverAt from "./DeliverAt.ts"
 import * as Entity from "./Entity.ts"
@@ -560,6 +561,50 @@ export const make = Effect.gen(function*() {
           }; ignoring duplicate definition with payload shape ${payloadShape(workflow)}`
         ).pipe(Effect.andThen(registration))
       }),
+
+    resolveExecutionId: Effect.fnUntraced(function*(workflow, payload, candidateExecutionId) {
+      if (typeof (workflow as any).idempotencyKey !== "function") {
+        return candidateExecutionId
+      }
+      let legacyKey: string
+      try {
+        legacyKey = (workflow as any).idempotencyKey(payload)
+      } catch {
+        return candidateExecutionId
+      }
+      if (typeof legacyKey !== "string") {
+        return candidateExecutionId
+      }
+
+      const candidateRequestId = yield* requestIdFor({
+        workflow,
+        entityType: `Workflow/${workflow._tag}`,
+        executionId: candidateExecutionId,
+        tag: "run",
+        id: ""
+      })
+      if (Option.isSome(candidateRequestId)) {
+        return candidateExecutionId
+      }
+
+      const legacyExecutionId = yield* makeHashDigest(`${workflow._tag}-${legacyKey}`)
+      if (legacyExecutionId === candidateExecutionId) {
+        return candidateExecutionId
+      }
+
+      const legacyRequestId = yield* requestIdFor({
+        workflow,
+        entityType: `Workflow/${workflow._tag}`,
+        executionId: legacyExecutionId,
+        tag: "run",
+        id: ""
+      })
+      if (Option.isSome(legacyRequestId)) {
+        return legacyExecutionId
+      }
+
+      return candidateExecutionId
+    }, Effect.orDie),
 
     execute: (workflow, { discard, executionId, parent, payload }) => {
       ensureEntity(workflow)

@@ -25,6 +25,7 @@ import * as Scope from "../Scope.ts"
 import type * as Activity from "./Activity.ts"
 import type { DurableClock } from "./DurableClock.ts"
 import type * as DurableDeferred from "./DurableDeferred.ts"
+import { makeHashDigest } from "./internal/crypto.ts"
 import * as Workflow from "./Workflow.ts"
 
 /**
@@ -398,6 +399,11 @@ export interface Encoded {
   ) => Effect.Effect<
     Discard extends true ? void : Workflow.Result<unknown, unknown>
   >
+  readonly resolveExecutionId?: (
+    workflow: Workflow.Any,
+    payload: unknown,
+    candidateExecutionId: string
+  ) => Effect.Effect<string>
   readonly poll: (
     workflow: Workflow.Any,
     executionId: string
@@ -492,7 +498,9 @@ export const makeUnsafe = (options: Encoded): WorkflowEngine["Service"] =>
       }
     ) {
       const payload = opts.payload
-      const executionId = opts.executionId
+      const executionId = options.resolveExecutionId
+        ? yield* options.resolveExecutionId(self, payload, opts.executionId)
+        : opts.executionId
       const suspendedRetrySchedule = opts.suspendedRetrySchedule ?? defaultRetrySchedule
       yield* Effect.annotateCurrentSpan({ executionId })
       let result = Option.none<Workflow.Result<Success["Type"], Error["Type"]>>()
@@ -830,6 +838,20 @@ export const layerMemory: Layer.Layer<WorkflowEngine> = Layer.effect(WorkflowEng
             return Effect.void
           })
         )
+      }),
+      resolveExecutionId: Effect.fnUntraced(function*(workflow, payload, candidateExecutionId) {
+        if (typeof (workflow as any).idempotencyKey !== "function") return candidateExecutionId
+        let legacyKey: string
+        try {
+          legacyKey = (workflow as any).idempotencyKey(payload)
+        } catch {
+          return candidateExecutionId
+        }
+        if (typeof legacyKey !== "string") return candidateExecutionId
+        if (executions.has(candidateExecutionId)) return candidateExecutionId
+        const legacyExecutionId = yield* makeHashDigest(`${workflow._tag}-${legacyKey}`)
+        if (executions.has(legacyExecutionId)) return legacyExecutionId
+        return candidateExecutionId
       }),
       poll: (_workflow, executionId) =>
         Effect.suspend(() => {
