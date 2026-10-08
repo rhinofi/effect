@@ -10885,14 +10885,39 @@ export function Cause<E extends Constraint, D extends Constraint>(error: E, defe
         importDeclarations: [`import * as Cause from "effect/Cause"`]
       }),
       expected: "Cause",
-      toCodec: ([error, defect]) =>
-        link<Cause_.Cause<E["Encoded"]>>()(
-          ArraySchema(CauseReason(error, defect)),
+      toCodec: ([error, defect]) => {
+        const v3ToV4Cause = (u: any): Cause_.Cause<any> => {
+          if (!u || typeof u !== "object") return Cause_.empty
+          switch (u._tag) {
+            case "Empty": return Cause_.empty
+            case "Fail": return Cause_.fail(u.error)
+            case "Die": return Cause_.die(u.defect)
+            case "Interrupt": return Cause_.interrupt(u.fiberId)
+            case "Sequential":
+            case "Parallel":
+              return Cause_.combine(v3ToV4Cause(u.left), v3ToV4Cause(u.right))
+            default:
+              return Cause_.empty
+          }
+        }
+        const v4Schema = ArraySchema(CauseReason(error, defect))
+        const v3Schema = declare(
+          (u): u is object => typeof u === "object" && u !== null && !Array.isArray(u) && "_tag" in u,
+          { expected: "Cause.Tree" }
+        )
+        return link<Cause_.Cause<E["Encoded"]>>()(
+          Union([v4Schema, v3Schema]),
           SchemaTransformation.transform({
-            decode: Cause_.fromReasons,
+            decode: (input) => {
+              if (Array.isArray(input)) {
+                return Cause_.fromReasons(input)
+              }
+              return v3ToV4Cause(input)
+            },
             encode: ({ reasons: failures }) => failures
           })
         )
+      }
     }
   )
   return make(schema.ast, { error, defect })
@@ -13254,24 +13279,39 @@ export function Exit<
         importDeclarations: [`import * as Exit from "effect/Exit"`]
       }),
       expected: "Exit",
-      toCodec: ([value, error, defect]) =>
-        link<Exit_.Exit<A["Encoded"], E["Encoded"]>>()(
+      toCodec: ([value, error, defect]) => {
+        const isVoidLikeAst = (ast: any): boolean => {
+          if (!ast) return false
+          if (ast._tag === "Void" || ast._tag === "Undefined" || ast._tag === "Any" || ast._tag === "Unknown") {
+            return true
+          }
+          if (ast._tag === "Union") {
+            return ast.types.some(isVoidLikeAst)
+          }
+          return SchemaAST.containsUndefined(ast)
+        }
+        const isVoidLike = isVoidLikeAst(value.ast)
+        const successSchema = isVoidLike
+          ? Union([Struct({ _tag: Literal("Success"), value }), Struct({ _tag: Literal("Success") })])
+          : Struct({ _tag: Literal("Success"), value })
+        return link<Exit_.Exit<A["Encoded"], E["Encoded"]>>()(
           Union([
-            Struct({ _tag: Literal("Success"), value }),
+            successSchema,
             Struct({
               _tag: Literal("Failure"),
               cause: Cause(error, defect)
             })
           ]),
-          SchemaTransformation.transform({
-            decode: (e): Exit_.Exit<A["Encoded"], E["Encoded"]> =>
-              e._tag === "Success" ? Exit_.succeed(e.value) : Exit_.failCause(e.cause),
+          SchemaTransformation.transform<any, any>({
+            decode: (e: any): Exit_.Exit<A["Encoded"], E["Encoded"]> =>
+              e._tag === "Success" ? Exit_.succeed("value" in e ? (e as any).value : undefined) : Exit_.failCause(e.cause),
             encode: (exit) =>
               Exit_.isSuccess(exit)
                 ? { _tag: "Success", value: exit.value } as const
                 : { _tag: "Failure", cause: exit.cause } as const
           })
         )
+      }
     }
   )
   return make(schema.ast, { value, error, defect })
